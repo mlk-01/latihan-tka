@@ -541,7 +541,7 @@
   // ============================================================================
   const IS_PREVIEW = false;
   const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
-    apiKey: "AIzaSyCXkYV87QWic2CFJU2B-6Jy1ujC4-UoVrA",
+   apiKey: "AIzaSyCXkYV87QWic2CFJU2B-6Jy1ujC4-UoVrA",
   authDomain: "tka-versi-2.firebaseapp.com",
   projectId: "tka-versi-2",
   storageBucket: "tka-versi-2.firebasestorage.app",
@@ -646,13 +646,33 @@
       return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
     }
 
+    // Batas percobaan tangkap layar / keluar halaman saat ujian. Lewat batas => jawaban otomatis dikumpulkan.
+    const MAX_VIOLATIONS = 3;
+    let lastViolationAt = 0;
+    function registerViolation(label) {
+      const sess = STATE.examSession;
+      if (!sess || !sess.active) return;
+      const now = Date.now();
+      if (now - lastViolationAt < 1500) return; // satu aksi = satu pelanggaran
+      lastViolationAt = now;
+      sess.violations = (sess.violations || 0) + 1;
+      const sisa = MAX_VIOLATIONS - sess.violations;
+      if (sisa > 0) {
+        showToast(`${label} Pelanggaran ${sess.violations}/${MAX_VIOLATIONS}. Ujian otomatis dikumpulkan jika mencapai ${MAX_VIOLATIONS}.`, 'error');
+      } else {
+        showToast('Batas pelanggaran tercapai. Jawaban dikumpulkan otomatis.', 'error');
+        try { finishAndSubmitExam(); } catch (e) { console.error(e); }
+      }
+    }
+
     function triggerShield(reason) {
       document.body.classList.add('privacy-blur-active');
       if (shield) shield.classList.remove('hidden');
+      registerViolation(reason || 'Tangkapan layar terdeteksi.');
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText('Tangkapan layar dinonaktifkan pada SIAP TKA SD Versi 1.2').catch(() => {});
       }
-      if (reason) showToast(reason, 'warning');
+      if (reason && !(STATE.examSession && STATE.examSession.active)) showToast(reason, 'warning');
     }
 
     window.resumeProtectedScreen = function() {
@@ -692,7 +712,27 @@
       if (document.hidden && STATE.examSession && STATE.examSession.active) {
         document.body.classList.add('privacy-blur-active');
         if (shield) shield.classList.remove('hidden');
+        registerViolation('Anda meninggalkan halaman ujian.');
       }
+    });
+
+    // Alat potong layar (Snipping Tool, Win+Shift+S) membuat jendela kehilangan fokus: layar langsung digelapkan.
+    window.addEventListener('blur', () => {
+      if (STATE.examSession && STATE.examSession.active) {
+        document.body.classList.add('privacy-blur-active');
+        if (shield) shield.classList.remove('hidden');
+      }
+    });
+    // Cetak / simpan PDF
+    window.addEventListener('beforeprint', () => {
+      document.body.classList.add('privacy-blur-active');
+      registerViolation('Pencetakan tidak diizinkan.');
+    });
+    // Salin/potong/seret dan pilih teks soal dinonaktifkan di luar kolom input
+    ['copy', 'cut', 'dragstart', 'selectstart'].forEach((evt) => {
+      document.addEventListener(evt, (ev) => {
+        if (!isTypingInFormField(ev.target)) ev.preventDefault();
+      });
     });
   }
 
@@ -3390,6 +3430,7 @@
     }
   };
 
+  const FIXED_ADMIN_EMAIL = 'admin2@tka.id';
   window.handleLoginAdmin = async function(e, opts = {}) {
     if (e && e.preventDefault) e.preventDefault();
     const rawEmailInput = String(opts.identifier !== undefined ? opts.identifier : document.getElementById('login-username').value).trim().toLowerCase();
@@ -3421,6 +3462,9 @@
         isAuthorizedAdmin = true;
       }
 
+      // Admin tetap admin2@tka.id (sandi awal admin123) juga berlaku di mode lokal
+      if (!useFirestoreCloud && email === FIXED_ADMIN_EMAIL && pass === 'admin123') isAuthorizedAdmin = true;
+
       // Mode lokal: admin tambahan yang dibuat dari menu Akun Admin
       if (!useFirestoreCloud && !isAuthorizedAdmin) {
         try {
@@ -3432,12 +3476,37 @@
       // Mode Firebase: wajib akun Firebase Auth yang terdaftar sebagai admin pada koleksi users_roles.
       if (!isAuthorizedAdmin && auth && db && useFirestoreCloud) {
         try {
-          const cred = await signInWithEmailAndPassword(auth, email, pass);
+          let cred;
+          try {
+            cred = await signInWithEmailAndPassword(auth, email, pass);
+          } catch (signErr) {
+            // Admin tetap: bila akunnya belum ada di Firebase Authentication, buat otomatis (sandi awal admin123).
+            const miss = ['auth/user-not-found', 'auth/invalid-credential', 'auth/invalid-login-credentials'].includes(signErr && signErr.code);
+            if (email === FIXED_ADMIN_EMAIL && pass === 'admin123' && miss) {
+              try {
+                cred = await createUserWithEmailAndPassword(auth, email, pass);
+                showToast('Akun admin2@tka.id dibuat di Firebase Authentication. Segera ganti sandi awalnya.', 'info');
+              } catch (createErr) {
+                window.__adminLoginHint = createErr && createErr.code === 'auth/email-already-in-use' ? 'wrongpass' : 'authfail';
+                throw signErr;
+              }
+            } else {
+              window.__adminLoginHint = signErr && signErr.code === 'auth/operation-not-allowed' ? 'authfail' : 'wrongpass';
+              throw signErr;
+            }
+          }
           currentAuthUser = cred.user;
           const roleRef = doc(db, 'artifacts', appId, 'public', 'data', 'users_roles', cred.user.uid);
+          if (email === FIXED_ADMIN_EMAIL) {
+            isAuthorizedAdmin = true;
+            try {
+              await setDoc(roleRef, { uid: cred.user.uid, email, namaLengkap: 'ADMINISTRATOR', role: 'admin', createdAt: Date.now(), updatedAt: Date.now() }, { merge: true });
+            } catch (roleErr) { console.warn('Dokumen peran admin tetap belum tertulis (Rules belum dipasang?):', roleErr); }
+          }
           let roleSnap = null;
+          if (!isAuthorizedAdmin)
           try { roleSnap = await getDoc(roleRef); } catch (readErr) { console.error('Gagal membaca peran admin:', readErr); }
-          if (roleSnap && roleSnap.exists() && roleSnap.data().role === 'admin') {
+          if (isAuthorizedAdmin || (roleSnap && roleSnap.exists() && roleSnap.data().role === 'admin')) {
             isAuthorizedAdmin = true;
           } else {
             // Pendaftaran ADMIN PERTAMA otomatis: hanya jika belum pernah ada admin (penanda app_config/admin_bootstrap
@@ -3532,6 +3601,10 @@
       const okSiswa = await window.handleLoginSiswa(null, sub);
       if (!okSiswa && window.__adminLoginHint === 'notAdmin') {
         showToast('Email/sandi benar di Firebase Auth, tetapi akun ini belum terdaftar sebagai admin (dokumen users_roles/UID belum ada).', 'warning');
+      } else if (!okSiswa && window.__adminLoginHint === 'wrongpass') {
+        showToast('Email atau kata sandi admin salah (atau akun belum terdaftar di Firebase Authentication).', 'warning');
+      } else if (!okSiswa && window.__adminLoginHint === 'authfail') {
+        showToast('Firebase Authentication menolak: aktifkan metode Email/Password di Authentication → Sign-in method.', 'warning');
       } else if (!okSiswa && window.__adminLoginHint === 'rules') {
         showToast('Akses ke Firestore ditolak. Pasang ulang Firestore Rules terbaru (ada aturan app_config) lalu coba lagi.', 'warning');
       }
@@ -5366,6 +5439,7 @@
                 <i class="fa-regular fa-image"></i> <span id="ed-opsi-imgbtn-${k}">Tambah Gambar</span>
                 <input type="file" accept="image/*" class="hidden" onchange="window.editorPickOpsiFile('${k}', event)" />
               </label>
+              <input id="ed-opsi-url-${k}" type="url" value="${esc((editorCtx.opsi[k] && editorCtx.opsi[k].url) || '')}" oninput="window.editorOpsiUrlInput('${k}')" placeholder="atau tempel link gambar opsi ${k} (https://...)" class="flex-1 min-w-[200px] px-3 py-1.5 rounded-lg border border-slate-300 text-[12px] outline-none focus:border-blue-600" />
               <button type="button" id="ed-opsi-rm-${k}" onclick="window.editorRemoveOpsiGambar('${k}')" class="hidden px-3 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold text-[11px] flex items-center gap-1.5">
                 <i class="fa-solid fa-trash-can"></i> Hapus Gambar
               </button>
@@ -5427,7 +5501,7 @@
     const lbl = document.getElementById('ed-opsi-imgbtn-' + k);
     if (!img || !rm || !lbl) return;
     let src = '';
-    if (!c.remove) src = c.data || (c.gambarId ? (STATE.gambarMap[c.gambarId] || '') : '') || c.url || '';
+    if (!c.remove) src = c.data || c.url || (c.gambarId ? (STATE.gambarMap[c.gambarId] || '') : '');
     if (src) {
       img.src = src;
       img.classList.remove('hidden');
@@ -5456,6 +5530,8 @@
       editorCtx.opsi[k].data = await compressImageFile(file);
       editorCtx.opsi[k].remove = false;
       editorCtx.opsi[k].url = '';
+      const uIn = document.getElementById('ed-opsi-url-' + k);
+      if (uIn) uIn.value = '';
       refreshOpsiPreview(k);
     } catch (err) {
       showToast('Gambar tidak dapat diproses. Coba file lain.', 'error');
@@ -5463,10 +5539,23 @@
     e.target.value = '';
   };
 
+  window.editorOpsiUrlInput = function(k) {
+    if (!editorCtx || !editorCtx.opsi[k]) return;
+    const inp = document.getElementById('ed-opsi-url-' + k);
+    const v = inp ? inp.value.trim() : '';
+    const c = editorCtx.opsi[k];
+    if (v && !/^https?:\/\//i.test(v)) { c.url = ''; refreshOpsiPreview(k); return; }
+    c.url = v;
+    if (v) { c.data = ''; c.remove = false; }
+    refreshOpsiPreview(k);
+  };
+
   window.editorRemoveOpsiGambar = function(k) {
     if (!editorCtx || !editorCtx.opsi[k]) return;
     editorCtx.opsi[k].data = '';
     editorCtx.opsi[k].url = '';
+    const uIn = document.getElementById('ed-opsi-url-' + k);
+    if (uIn) uIn.value = '';
     editorCtx.opsi[k].remove = true;
     refreshOpsiPreview(k);
   };
@@ -5661,6 +5750,7 @@
             if (!og) og = 'IMG_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
             await saveGambarToCloud(og, c.data);
           } else if (c.url) {
+            og = '';
             ou = c.url;
           }
           if (og) o.gambarId = og;
